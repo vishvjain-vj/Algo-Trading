@@ -1,346 +1,329 @@
 # ==========================================
 # FILE: core/backtester.py
-# PURPOSE: Simulate trading and calculate PnL
+# PURPOSE: Day-by-day portfolio simulation across multiple tickers.
 #
-# CHANGES FROM PREVIOUS VERSION:
-#   1. Position sizing now uses Confidence column (fixes the 0.5/1.0 bug)
-#   2. Signal_Display column added: 1 on entry day, 0 while holding, -1 on exit day
-#   3. print_metrics() replaced with generate_trade_log() — per-trade table
-#   4. ATR-based stop-loss added (configurable, default 2x ATR)
-#   5. Max drawdown tracked per trade
-#   6. Buy & Hold comparison REMOVED from output (per your request)
+# WHAT THIS FILE DOES (plain English):
+#   - Takes a dictionary of {ticker: processed_dataframe} from the strategy
+#   - Walks through every trading day in chronological order
+#   - On each day: checks if any open position should exit, then checks if any
+#     new position should be entered
+#   - Produces a trade log DataFrame at the end
+#
+# BUGS FIXED FROM PREVIOUS VERSION:
+#   1. STOP-LOSS EXIT PRICE — was using close_price when stop triggered.
+#      A stop order fires at the stop price, not wherever the stock closes.
+#      Fixed: exit at stop_price when stop is triggered. For gap-down days
+#      (open far below stop) this is still optimistic vs reality, but it is
+#      the standard approach with daily OHLC data.
+#
+#   2. LOGIC GATE MISSING GUARD — PortfolioBacktester was missing the
+#      "close > stop_price" check that SimpleBacktester had. Without it, the
+#      gate could exit a trade at a profit even on a day when the price was
+#      already below the stop level. Fixed: added the guard condition.
+#
+#   3. DEAD CODE REMOVED — SimpleBacktester was never called by
+#      main_multiTicker.py. Keeping it caused confusion about which class
+#      was actually running. Removed entirely. If you need single-stock
+#      backtesting in future, build it as a wrapper around PortfolioBacktester.
+#
+# NOTE ON EXITS (important to understand):
+#   The strategy (strategy_1_ema.py) generates Signal = -1 for bearish
+#   crossovers. PortfolioBacktester does NOT use that signal as an exit.
+#   The only exits are: Logic Gate, Target Hit, and Trailing Stop-loss.
+#   The -1 signal from the strategy is intentionally ignored here.
+#   If you want to re-enable EMA-cross exits, add this block in section B:
+#       if 'Signal' in df.columns and row['Signal'] == -1:
+#           is_exit, exit_reason = True, "EMA Cross"
 # ==========================================
+
 import pandas as pd
 import numpy as np
 
 
-class SimpleBacktester:
-    def __init__(self, data, initial_capital=100_000, atr_stop_multiplier=1.5):
-        """
-        Parameters
-        ----------
-        data                 : DataFrame from strategy.run()
-        initial_capital      : Starting money in ₹
-        atr_stop_multiplier  : Stop-loss = entry_price - (multiplier × ATR_14)
-                               Default 2.0 means stop is 2 ATRs below entry.
-                               Set to None to disable ATR stop-loss.
-        """
-        self.df                  = data.copy()
-        self.initial_capital     = initial_capital
-        self.atr_stop_multiplier = atr_stop_multiplier
+class PortfolioBacktester:
+    """
+    Simulates a shared-capital portfolio across multiple tickers, day by day.
+
+    Parameters
+    ----------
+    data_dict         : dict of {ticker_string: processed_DataFrame}
+                        Each DataFrame must have columns:
+                        Close, Low, ATR_14, Signal, Confidence
+    initial_capital   : Starting cash in rupees (default ₹1,00,000)
+    atr_stop_mult     : Trailing stop = peak_close - (atr_stop_mult × ATR_14)
+                        Default 2.0 means stop sits 2 ATRs below the peak.
+    atr_target_mult   : Take-profit = entry + (atr_target_mult × ATR_14)
+                        Default 4.0 gives a 1:2 risk-to-reward ratio
+                        (stop is 2×ATR away, target is 4×ATR away).
+    max_positions     : Max number of stocks held simultaneously (default 6)
+    gate_days         : Logic Gate check frequency in calendar days (default 15)
+    min_gate_profit   : Minimum return % to trigger a Logic Gate exit (default 0.02 = 2%)
+    """
+
+    def __init__(
+        self,
+        data_dict,
+        initial_capital   = 100_000,
+        atr_stop_mult     = 2.0,
+        atr_target_mult   = 4.0,   # FIX: was hardcoded as 2.0 inside the loop (1:1 RR). Now 4.0 = 1:2 RR.
+        max_positions     = 6,
+        gate_days         = 15,
+        min_gate_profit   = 0.02,
+    ):
+        self.data_dict       = data_dict
+        self.initial_capital = initial_capital
+        self.available_cash  = float(initial_capital)
+        self.atr_stop_mult   = atr_stop_mult
+        self.atr_target_mult = atr_target_mult
+        self.max_positions   = max_positions
+        self.gate_days       = gate_days
+        self.min_gate_profit = min_gate_profit
 
     # ------------------------------------------------------------------
-    # MAIN BACKTEST
+    # INTERNAL HELPER: build a sorted list of every unique trading date
+    # across all tickers. This is the "master calendar" for the simulation.
     # ------------------------------------------------------------------
-    def run_backtest(self):
-        print("\nRunning Backtest Simulator...")
-
-        df = self.df
-
-        # ------------------------------------------------------------------
-        # 1. Position column (forward-filled — used for PnL math)
-        #    Uses Confidence so 0.5 = half capital, 1.0 = full capital.
-        #    THIS IS THE FIX for the position sizing bug.
-        # ------------------------------------------------------------------
-        df['Position'] = np.nan
-        df.loc[df['Signal'] == 1,  'Position'] = df.loc[df['Signal'] == 1,  'Confidence']
-        df.loc[df['Signal'] == -1, 'Position'] = 0.0
-        df.loc[df['Signal'] == 0,  'Position'] = 0.0
-        df['Position'] = df['Position'].ffill().fillna(0.0)
-
-        # ------------------------------------------------------------------
-        # 2. Signal_Display: 1 on entry candle only, 0 while holding, -1 on exit
-        #    This is for display/reporting only — NOT used for PnL.
-        # ------------------------------------------------------------------
-        df['Signal_Display'] = 0
-        # Entry candles: where Signal == 1
-        df.loc[df['Signal'] == 1, 'Signal_Display'] = 1
-        # Exit candles: where Signal is 0 or -1 AND previous position was > 0
-        prev_position = df['Position'].shift(1)
-        exit_mask = ((df['Signal'] == 0) | (df['Signal'] == -1)) & (prev_position > 0)
-        df.loc[exit_mask, 'Signal_Display'] = -1
-
-        # ------------------------------------------------------------------
-        # 3. ATR-based stop-loss (optional)
-        #    Each day while in a trade: check if Close dropped below stop price.
-        #    If yes: override Position to 0 (exit).
-        # ------------------------------------------------------------------
-        df['Stop_Price']    = np.nan
-        df['Stop_Triggered'] = False
-
-        # if self.atr_stop_multiplier is not None and 'ATR_14' in df.columns:
-        #     print(f"  Applying ATR stop-loss ({self.atr_stop_multiplier}x ATR)...")
-        #     in_trade    = False
-        #     stop_price  = None
-        #     entry_conf  = None
-
-        #     for idx in df.index:
-        #         sig   = df.loc[idx, 'Signal']
-        #         close = df.loc[idx, 'Close']
-        #         atr   = df.loc[idx, 'ATR_14']
-
-        #         if not in_trade and sig == 1:
-        #             in_trade   = True
-        #             stop_price = close - (self.atr_stop_multiplier * atr)
-        #             entry_conf = df.loc[idx, 'Confidence']
-        #             df.loc[idx, 'Stop_Price'] = stop_price
-
-        #         elif in_trade:
-        #             df.loc[idx, 'Stop_Price'] = stop_price  # carry forward for display
-
-        #             # Check: did the close hit the stop?
-        #             if close <= stop_price:
-        #                 df.loc[idx, 'Position']       = 0.0
-        #                 df.loc[idx, 'Signal_Display'] = -1  # mark as exit
-        #                 df.loc[idx, 'Stop_Triggered'] = True
-        #                 in_trade   = False
-        #                 stop_price = None
-        #                 entry_conf = None
-        #                 print(f"  Stop-loss triggered on {idx.date()} at ₹{close:.2f}")
-
-        #             # Normal EMA exit
-        #             elif (sig == 0) or (sig == -1):
-        #                 in_trade   = False
-        #                 stop_price = None
-        #                 entry_conf = None
-
-
-        # -------------------------------
-        #  ---- TRAILING LOSS EXIT  ||  Risk : Reward Exit  -----
-        # -------------------------------
-        df['Stop_Price']     = np.nan
-        df['Stop_Triggered'] = False
-        df['TP_Triggered']   = False  # NEW: Track if we hit the target
-
-        if self.atr_stop_multiplier is not None and 'ATR_14' in df.columns:
-            print(f"  Applying Hard Take-Profit (4x ATR) & Stop-Loss ({self.atr_stop_multiplier}x ATR)...")
-            in_trade          = False
-            stop_price        = None
-            take_profit_price = None
-
-            for idx in df.index:
-                sig   = df.loc[idx, 'Signal']
-                close = df.loc[idx, 'Close']
-                atr   = df.loc[idx, 'ATR_14']
-                low   = df.loc[idx, 'Low']
-                # --- 1. ENTRY ---
-                if not in_trade and sig == 1:
-                    in_trade          = True
-                    highest_close     = close
-                    stop_price        = highest_close - (self.atr_stop_multiplier * atr)
-                    take_profit_price = close + (2.0* atr)  # 1:2 Risk/Reward Target
-                    df.loc[idx, 'Stop_Price'] = stop_price
-
-                # --- 2. HOLDING THE TRADE ---
-                elif in_trade:
-                    # INTRODUCING trailing stop (it moves upwards)
-                   #  new_stop = close - (self.atr_stop_multiplier * atr)  ==> ONLY SEES EACH DAY CLOSE=> WRONG
-                   
-                   #  THIS NEW SYSTEM SEES HIGHEST CLOSE SEEN YET AND SELECTS BEST STOP TARGET HIT IN WORSE COND
-                    highest_close = max(highest_close, close)
-                    new_stop = highest_close - (self.atr_stop_multiplier * atr)
-                    if new_stop > stop_price:
-                        stop_price = new_stop
-
-                    df.loc[idx, 'Stop_Price'] = stop_price  
-
-                    # --- 3a. CHECK FOR TAKE-PROFIT EXIT (Target Hit!) ---
-                    if close >= take_profit_price:
-                        df.loc[idx, 'Position']       = 0.0
-                        df.loc[idx, 'Signal_Display'] = -1  
-                        df.loc[idx, 'TP_Triggered']   = True
-                        in_trade          = False
-                        stop_price        = None
-                        take_profit_price = None
-                        highest_close = None
-                        print(f"  🎯 Target Hit! Take-profit triggered on {idx.date()} at ₹{close:.2f}")
-
-                    # --- 3b. CHECK FOR STOP-LOSS EXIT ---
-                    elif low <= stop_price:
-                        df.loc[idx, 'Position']       = 0.0
-                        df.loc[idx, 'Signal_Display'] = -1  
-                        df.loc[idx, 'Stop_Triggered'] = True
-                        in_trade          = False
-                        stop_price        = None
-                        take_profit_price = None
-                        highest_close = None
-                        print(f"  🛑 Stop-loss triggered on {idx.date()} at ₹{close:.2f}")
-
-                    # --- 4. NORMAL EMA EXIT ---
-                    elif (sig == 0) or (sig == -1):
-                        in_trade          = False
-                        stop_price        = None
-                        take_profit_price = None
-                        highest_close = None
-
-        # ------------------------------------------------------------------
-        # 4. Daily returns
-        # ------------------------------------------------------------------
-        df['Market_Returns']   = df['Close'].pct_change()
-        df['Strategy_Returns'] = df['Market_Returns'] * df['Position'].shift(1)
-
-        # Cumulative portfolio value
-        df['Portfolio_Value']  = self.initial_capital * \
-                                 (1 + df['Strategy_Returns']).cumprod()
-
-        self.df = df
-        return df
+    def _build_master_calendar(self):
+        all_dates = set()
+        for df in self.data_dict.values():
+            all_dates.update(df.index)
+        return sorted(all_dates)
 
     # ------------------------------------------------------------------
-    # TRADE LOG (replaces print_metrics)
+    # INTERNAL HELPER: decide the correct exit price depending on the
+    # reason for exit.
+    #
+    # WHY THIS MATTERS (the bug this fixes):
+    #   Previously the code always used close_price as the exit price,
+    #   even for stop-loss exits. But if the day's Low touched the stop,
+    #   the actual exit in real trading happens AT the stop price
+    #   (your broker's stop order fills there), not at the day's close.
+    #
+    #   Example: stop = ₹140, day's low = ₹135, day's close = ₹145.
+    #   Old code: exit at ₹145 → stop didn't actually protect you.
+    #   Fixed code: exit at ₹140 → stop did its job.
+    #
+    #   For gap-down scenarios (stock opens below stop), this is still
+    #   slightly optimistic (real fill might be at the open, not stop price),
+    #   but daily OHLC data doesn't let us do better.
     # ------------------------------------------------------------------
-    def generate_trade_log(self):
-        """
-        Builds a per-trade table with:
-          Entry Date, Entry Price, Exit Date, Exit Price,
-          Confidence, Return %, Profit/Loss ₹, Max Drawdown %, Exit Reason, Days Held
-        """
-        df      = self.df
-        capital = self.initial_capital
-        trades  = []
+    def _get_exit_price(self, exit_reason, close_price, stop_price):
+        if exit_reason == "Stop-loss":
+            # Exit at the stop level, not wherever the stock happens to close.
+            return stop_price
+        # For Logic Gate, Target Hit: close price is a fair approximation.
+        return close_price
 
-        in_trade        = False
-        entry_date      = None
-        entry_price     = None
-        entry_conf      = None
-        capital_deployed = None
-        daily_lows      = []   # track intra-trade drawdown
+    # ------------------------------------------------------------------
+    # MAIN SIMULATION
+    # ------------------------------------------------------------------
+    def run_portfolio_backtest(self):
+        print(f"\n[Portfolio Engine] Starting simulation | Capital: ₹{self.initial_capital:,.0f} | "
+              f"Max positions: {self.max_positions} | Stop: {self.atr_stop_mult}×ATR | "
+              f"Target: {self.atr_target_mult}×ATR")
 
-        for idx, row in df.iterrows():
-            sig   = row['Signal']
-            close = row['Close']
-            stop  = row.get('Stop_Triggered', False)
-            tp    = row.get('TP_Triggered', False)
+        master_calendar = self._build_master_calendar()
+        active_trades   = {}   # { ticker: trade_dict }
+        trade_log       = []
 
-           # --- ENTRY ---
-            if not in_trade and sig == 1:
-                in_trade         = True
-                entry_date       = idx
-                entry_price      = close
-                entry_conf       = row['Confidence'] if not pd.isna(row['Confidence']) else 0.5
-                
-                # --- RISK-BASED POSITION SIZING ---
-                # 1. Find the ATR (default to 1% of price if ATR is warming up)
-                atr = row.get('ATR_14', close * 0.01)
-                if pd.isna(atr) or atr == 0: 
-                    atr = close * 0.01
-                
-                # 2. Calculate Stop-Loss Distance in ₹
-                stop_distance = atr * self.atr_stop_multiplier
-                
-                # 3. We are willing to risk exactly 1% of our CURRENT capital
-                risk_allowed = capital * 0.05
-                
-                # 4. How many shares can we safely buy?
-                shares = risk_allowed / stop_distance
-                
-                # 5. How much cash does that cost?
-                capital_deployed = shares * entry_price
-                
-                # 6. Safety Check: No margin trading. Can't spend more than we have!
-                if capital_deployed > capital:
-                    capital_deployed = capital
-                    
-                # 7. Apply Confidence Tier (0.5 confidence = risk half as much)
-                capital_deployed = capital_deployed * entry_conf
-                
-                daily_lows       = [close]
+        for current_date in master_calendar:
 
-            # --- WHILE IN TRADE ---
-            elif in_trade:
-                daily_lows.append(close)
+            # -------------------------------------------------------
+            # A. UPDATE OPEN POSITION VALUES (for equity calculation)
+            # -------------------------------------------------------
+            open_value = 0.0
+            for ticker, trade in active_trades.items():
+                df = self.data_dict[ticker]
+                if current_date in df.index:
+                    price = df.loc[current_date, 'Close']
+                    trade['last_price'] = price
+                else:
+                    price = trade['last_price']   # use last known price on non-trading days
+                open_value += trade['shares'] * price
 
-                # --- EXIT (EMA cross, stop-loss, or signal -1) ---
-                is_exit = (sig == 0) or (sig == -1) or stop or tp
+            total_equity = self.available_cash + open_value
+
+            # -------------------------------------------------------
+            # B. CHECK FOR EXITS (process before entries on same day)
+            # -------------------------------------------------------
+            exited = []
+
+            for ticker, trade in active_trades.items():
+                df = self.data_dict[ticker]
+                if current_date not in df.index:
+                    continue
+
+                row         = df.loc[current_date]
+                close_price = row['Close']
+                low_price   = row['Low']
+                atr         = row['ATR_14']
+                days_held   = (current_date - trade['entry_date']).days
+
+                # Update trailing stop: only move the stop UP, never down.
+                # The stop follows the highest closing price the stock reached.
+                if close_price > trade['peak_close']:
+                    trade['peak_close'] = close_price
+                    new_stop = close_price - (self.atr_stop_mult * atr)
+                    if new_stop > trade['stop_price']:
+                        trade['stop_price'] = new_stop
+
+                trade['price_history'].append(close_price)
+
+                is_exit     = False
+                exit_reason = ""
+
+                # --- EXIT 1: Logic Gate ("Bird in Hand" rule) ---
+                # Every `gate_days` calendar days, check if we are sitting on
+                # a decent profit. If yes, bank it rather than risk giving it back.
+                #
+                # GUARD ADDED (Bug 5 fix): also require close > stop_price,
+                # so we don't gate-exit on a day where the stop was also nearly hit.
+                if days_held > 0 and days_held % self.gate_days == 0:
+                    current_return = (close_price - trade['entry_price']) / trade['entry_price']
+                    if current_return >= self.min_gate_profit and close_price > trade['stop_price']:
+                        is_exit, exit_reason = True, "Logic Gate"
+
+                # --- EXIT 2: Take-Profit ---
+                if not is_exit and close_price >= trade['take_profit_price']:
+                    is_exit, exit_reason = True, "Target Hit"
+
+                # --- EXIT 3: Trailing Stop-Loss ---
+                # Triggered when the day's LOW breaches the stop level.
+                # Exit price is the STOP PRICE, not the close. (Bug 1 fix)
+                if not is_exit and low_price <= trade['stop_price']:
+                    is_exit, exit_reason = True, "Stop-loss"
+
                 if is_exit:
-                    exit_date  = idx
-                    exit_price = close
+                    # BUG 1 FIX: use stop_price as exit when stop triggered,
+                    # not close_price.
+                    exit_price  = self._get_exit_price(exit_reason, close_price, trade['stop_price'])
+                    exit_value  = trade['shares'] * exit_price
+                    pnl_inr     = exit_value - trade['capital_deployed']
+                    return_pct  = (pnl_inr / trade['capital_deployed']) * 100
 
-                    # 1. Calculate actual money made/lost (INR) based on the stock's move
-                    stock_pnl_pct = (exit_price - entry_price) / entry_price
-                    pnl_inr       = capital_deployed * stock_pnl_pct
-                    
-                    # 2. PORTFOLIO Return % (How much did our ENTIRE account change?)
-                    pnl_pct       = (pnl_inr / capital) * 100
-                    
-                    days_held     = (exit_date - entry_date).days
+                    # Max drawdown for this specific trade
+                    max_dd_pct  = self._calc_max_drawdown(trade['price_history'], trade['entry_price'])
 
-                    # 3. PORTFOLIO Max Drawdown % (How much of the total account was at risk?)
-                    max_dd_pct = 0.0
-                    running_max = entry_price
-                    for p in daily_lows:
-                        if p > running_max:
-                            running_max = p
-                        
-                        # Calculate the stock's drop
-                        stock_dd = (p - running_max) / running_max
-                        # Convert that to actual rupees lost at that moment
-                        money_lost = capital_deployed * stock_dd 
-                        # Calculate what percentage of the total account that represents
-                        account_dd_pct = (money_lost / capital) * 100
-                        
-                        if account_dd_pct < max_dd_pct:
-                            max_dd_pct = account_dd_pct
+                    self.available_cash += exit_value
 
-                    exit_reason = "Target Hit" if tp else ("Stop-loss" if stop else ("EMA cross" if sig in [0, -1] else "Signal"))
-
-                    trades.append({
-                        'Entry Date'     : entry_date.strftime('%d %b %Y') if hasattr(entry_date, 'strftime') else entry_date,
-                        'Entry Price ₹'  : round(entry_price, 2),
-                        'Exit Date'      : exit_date.strftime('%d %b %Y') if hasattr(exit_date, 'strftime') else exit_date,
-                        'Exit Price ₹'   : round(exit_price, 2),
-                        'Confidence'     : entry_conf,
-                        'Capital Used ₹' : round(capital_deployed, 0),
-                        'Return %'       : round(pnl_pct, 2),       # <--- Now reports Portfolio % !
-                        'P&L ₹'          : round(pnl_inr, 2),
-                        'Max Drawdown %' : round(max_dd_pct, 2),    # <--- Now reports Portfolio DD% !
-                        'Days Held'      : days_held,
-                        'Exit Reason'    : exit_reason,
+                    trade_log.append({
+                        'Ticker'        : ticker,
+                        'Entry Date'    : trade['entry_date'].strftime('%d %b %Y'),
+                        'Entry Price ₹' : round(trade['entry_price'], 2),
+                        'Exit Date'     : current_date.strftime('%d %b %Y'),
+                        'Exit Price ₹'  : round(exit_price, 2),
+                        'Confidence'    : trade['confidence'],
+                        'Capital Used ₹': round(trade['capital_deployed'], 0),
+                        'Return %'      : round(return_pct, 2),
+                        'P&L ₹'        : round(pnl_inr, 2),
+                        'Max Drawdown %': round(max_dd_pct, 2),
+                        'Days Held'     : days_held,
+                        'Exit Reason'   : exit_reason,
                     })
+                    exited.append(ticker)
 
-                    # --- COMPOUNDING ---
-                    # Update our total capital with the profit or loss
-                    capital += pnl_inr
-                    
-                    in_trade = False
+            for t in exited:
+                del active_trades[t]
 
-        trades_df = pd.DataFrame(trades)
-        return trades_df
+            # -------------------------------------------------------
+            # C. CHECK FOR NEW ENTRIES
+            # -------------------------------------------------------
+            if len(active_trades) >= self.max_positions:
+                continue   # portfolio is full, skip entry scan
 
-    def print_trade_report(self):
-        """Prints the full trade log + summary statistics."""
-        trades_df = self.generate_trade_log()
+            for ticker, df in self.data_dict.items():
+                if ticker in active_trades:
+                    continue
+                if current_date not in df.index:
+                    continue
 
-        if trades_df.empty:
-            print("No completed trades found.")
+                row = df.loc[current_date]
+                if row['Signal'] != 1:
+                    continue
+
+                entry_price = row['Close']
+                atr         = row['ATR_14'] if not pd.isna(row['ATR_14']) else entry_price * 0.01
+                stop_dist   = self.atr_stop_mult * atr
+
+                # Position sizing: risk 2% of total equity per trade,
+                # but cap at an equal share of total equity across max_positions.
+                max_allocation  = total_equity / self.max_positions
+                risk_budget     = total_equity * 0.02
+                shares          = risk_budget / stop_dist
+                capital_needed  = min(shares * entry_price, max_allocation)
+
+                if self.available_cash < capital_needed or capital_needed <= 0:
+                    continue
+
+                actual_shares        = capital_needed / entry_price
+                self.available_cash -= capital_needed
+
+                active_trades[ticker] = {
+                    'entry_date'      : current_date,
+                    'entry_price'     : entry_price,
+                    'confidence'      : row.get('Confidence', 1.0),
+                    'shares'          : actual_shares,
+                    'capital_deployed': capital_needed,
+                    'stop_price'      : entry_price - stop_dist,
+                    'take_profit_price': entry_price + (self.atr_target_mult * atr),
+                    'peak_close'      : entry_price,
+                    'price_history'   : [entry_price],
+                    'last_price'      : entry_price,
+                }
+
+                if len(active_trades) >= self.max_positions:
+                    break   # filled up, stop scanning more tickers
+
+        return pd.DataFrame(trade_log)
+
+    # ------------------------------------------------------------------
+    # INTERNAL HELPER: calculate the maximum intra-trade drawdown.
+    # "How far did the position fall from its peak at any point while we held it?"
+    # This is expressed as a % of the entry price (not portfolio equity).
+    # ------------------------------------------------------------------
+    def _calc_max_drawdown(self, price_history, entry_price):
+        max_dd  = 0.0
+        peak    = entry_price
+        for price in price_history:
+            if price > peak:
+                peak = price
+            dd = (price - peak) / peak * 100   # negative number
+            if dd < max_dd:
+                max_dd = dd
+        return max_dd   # negative percentage, e.g. -12.5 means 12.5% drawdown
+
+    # ------------------------------------------------------------------
+    # PRINT SUMMARY — call this after run_portfolio_backtest()
+    # ------------------------------------------------------------------
+    def print_summary(self, trade_log_df):
+        if trade_log_df.empty:
+            print("\nNo trades were completed.")
             return
 
-        # --- FIX: Calculate final value by adding up all actual P&L from the log ---
-        final_value   = self.initial_capital + trades_df['P&L ₹'].sum()
-        total_return  = ((final_value - self.initial_capital) / self.initial_capital) * 100
-        wins          = trades_df[trades_df['Return %'] > 0]
-        losses        = trades_df[trades_df['Return %'] <= 0]
-        win_rate      = (len(wins) / len(trades_df)) * 100
+        final_value  = self.initial_capital + trade_log_df['P&L ₹'].sum()
+        total_return = (final_value - self.initial_capital) / self.initial_capital * 100
+        wins         = trade_log_df[trade_log_df['Return %'] > 0]
+        losses       = trade_log_df[trade_log_df['Return %'] <= 0]
+        win_rate     = len(wins) / len(trade_log_df) * 100
 
-        print("\n" + "=" * 60)
-        print("              TRADE REPORT")
-        print("=" * 60)
-        print(f"Initial Capital :  ₹{self.initial_capital:>12,.2f}")
-        print(f"Final Value     :  ₹{final_value:>12,.2f}")
-        print(f"Total Return    :  {total_return:>+.2f}%")
-        print("-" * 60)
-        print(f"Total Trades    :  {len(trades_df)}")
-        print(f"Winning Trades  :  {len(wins)}  ({win_rate:.1f}%)")
-        print(f"Losing Trades   :  {len(losses)}  ({100 - win_rate:.1f}%)")
-        print(f"Avg Win         :  {wins['Return %'].mean():.2f}%")
-        print(f"Avg Loss        :  {losses['Return %'].mean():.2f}%")
-        print(f"Best Trade      :  {trades_df['Return %'].max():.2f}%")
-        print(f"Worst Trade     :  {trades_df['Return %'].min():.2f}%")
-        print(f"Avg Days Held   :  {trades_df['Days Held'].mean():.0f} days")
-        print(f"Stop-loss exits :  {(trades_df['Exit Reason'] == 'Stop-loss').sum()}")
-        print("=" * 60)
-        print("\nPer-trade breakdown:\n")
-        print(trades_df.to_string(index=False))
-        print("=" * 60)
-
-        return trades_df
+        print("\n" + "=" * 65)
+        print("                  PORTFOLIO PERFORMANCE SUMMARY")
+        print("=" * 65)
+        print(f"  Initial Capital  : ₹{self.initial_capital:>12,.2f}")
+        print(f"  Final Value      : ₹{final_value:>12,.2f}")
+        print(f"  Total Return     : {total_return:>+.2f}%")
+        print("-" * 65)
+        print(f"  Total Trades     : {len(trade_log_df)}")
+        print(f"  Winning Trades   : {len(wins)}  ({win_rate:.1f}%)")
+        print(f"  Losing Trades    : {len(losses)}  ({100 - win_rate:.1f}%)")
+        if not wins.empty:
+            print(f"  Avg Win          : {wins['Return %'].mean():.2f}%")
+        if not losses.empty:
+            print(f"  Avg Loss         : {losses['Return %'].mean():.2f}%")
+        print(f"  Best Trade       : {trade_log_df['Return %'].max():.2f}%")
+        print(f"  Worst Trade      : {trade_log_df['Return %'].min():.2f}%")
+        print(f"  Avg Days Held    : {trade_log_df['Days Held'].mean():.0f} days")
+        print(f"  Stop-loss exits  : {(trade_log_df['Exit Reason'] == 'Stop-loss').sum()}")
+        print(f"  Logic Gate exits : {(trade_log_df['Exit Reason'] == 'Logic Gate').sum()}")
+        print(f"  Target Hit exits : {(trade_log_df['Exit Reason'] == 'Target Hit').sum()}")
+        print("=" * 65)
