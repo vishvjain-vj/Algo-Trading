@@ -41,7 +41,7 @@ from core.backtester import PortfolioBacktester
 WATCHLIST        = ['BEL.NS', 'ADANIPOWER.NS', 'SOLARINDS.NS', 'SUNPHARMA.NS','RELIANCE.NS','STLTECH.NS']
 INITIAL_CAPITAL  = 100_000          # ₹1,00,000
 
-START            = "2022-01-01"
+START            = "2019-01-01"
 END              = "2026-05-10"
 
 # Strategy parameters
