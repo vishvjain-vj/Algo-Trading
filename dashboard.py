@@ -56,18 +56,6 @@ if count > 0:
 else:
     st.sidebar.caption("📋 Using built-in stock list")
 
-# Manual refresh button (for you/colleague to force update anytime)
-if st.sidebar.button("🔄 Force Refresh Stock List"):
-    with st.sidebar:
-        with st.spinner("Fetching latest NSE list..."):
-            ok = refresh_stock_list(force=True)
-    if ok:
-        st.sidebar.success(f"✅ Updated: {get_stock_count():,} stocks")
-        st.cache_data.clear()
-        st.rerun()
-    else:
-        st.sidebar.error("❌ Fetch failed. NSE site may be down. Try later.")
-
 # ── WATCHLIST ──────────────────────────────────────────────────────
 st.sidebar.markdown("---")
 st.sidebar.subheader("📊 Watchlist")
@@ -122,14 +110,34 @@ if st.session_state.watchlist:
         st.session_state.watchlist.remove(rem)
         st.sidebar.success(f"Removed {rem}")
         st.rerun()
+      
+# Manual refresh button (for you/colleague to force update anytime)
+if st.sidebar.button("🔄 Force Refresh Stock List"):
+    with st.sidebar:
+        with st.spinner("Fetching latest NSE list..."):
+            ok = refresh_stock_list(force=True)
+    if ok:
+        st.sidebar.success(f"✅ Updated: {get_stock_count():,} stocks")
+        st.cache_data.clear()
+        st.rerun()
+    else:
+        st.sidebar.error("❌ Fetch failed. NSE site may be down. Try later.")
 
 # ------------------------------------------------------------------
 # MAIN AREA
 # ------------------------------------------------------------------
-st.markdown("---")
-st.info(f"**Running backtest on:** {', '.join(st.session_state.watchlist)}")
+st.markdown("### 📋 Current Watchlist")
+cols = st.columns(4)
+for i, ticker in enumerate(st.session_state.watchlist):
+    cols[i % 4].markdown(
+        f"<div style='background:#1e2d3d; padding:8px 12px; border-radius:8px; "
+        f"margin:4px 0; color:#4fc3f7; font-weight:600; font-size:14px;'>"
+        f"📈 {ticker.replace('.NS','')}</div>",
+        unsafe_allow_html=True
+    )
+st.markdown("")
 
-if st.button("🚀 Run Backtest", type="primary"):
+if st.button(" Run Backtest", type="primary"):
 
     if not st.session_state.watchlist:
         st.error("Watchlist is empty. Add at least one ticker.")
