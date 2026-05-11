@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
-from nse_stocks import search_nse
-from nse_stock_updater import refresh_stock_list, get_last_updated, get_stock_count, needs_refresh
+from NSEStockList import search_nse
+from NSEStockUpdater import refresh_stock_list, get_last_updated, get_stock_count, needs_refresh
 from main_multiTicker import (WATCHLIST, INITIAL_CAPITAL, START, END,
                                FAST_SPAN, SLOW_SPAN, SLOPE_THRESHOLD,
                                ATR_STOP_MULT, ATR_TARGET_MULT,
