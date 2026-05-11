@@ -50,11 +50,7 @@ st.sidebar.markdown("---")
 count    = get_stock_count()
 updated  = get_last_updated()
 
-if count > 0:
-    st.sidebar.caption(f"📋 Stock list: **{count:,} NSE stocks**")
-    st.sidebar.caption(f"🔄 Last updated: {updated}")
-else:
-    st.sidebar.caption("📋 Using built-in stock list")
+
 
 # ── WATCHLIST ──────────────────────────────────────────────────────
 st.sidebar.markdown("---")
@@ -81,7 +77,7 @@ if query and len(query) >= 1:
 
     if results:
         options = [f"{sym.replace('.NS', '')} — {name}" for sym, name in results]
-        selected = st.sidebar.selectbox("Results (most popular first)", options)
+        selected = st.sidebar.selectbox("Results", options)
 
         if st.sidebar.button("➕ Add to Watchlist"):
             raw    = selected.split(" — ")[0].strip()
@@ -110,7 +106,11 @@ if st.session_state.watchlist:
         st.session_state.watchlist.remove(rem)
         st.sidebar.success(f"Removed {rem}")
         st.rerun()
-      
+if count > 0:
+    st.sidebar.caption(f"📋 Stock list: **{count:,} NSE stocks**")
+    st.sidebar.caption(f"🔄 Last updated: {updated}")
+else:
+    st.sidebar.caption("📋 Using built-in stock list")
 # Manual refresh button (for you/colleague to force update anytime)
 if st.sidebar.button("🔄 Force Refresh Stock List"):
     with st.sidebar:
