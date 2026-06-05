@@ -38,10 +38,10 @@ from core.backtester import PortfolioBacktester
 # -----------------------------------------------------------------------
 # ALL TUNABLE SETTINGS — only change things here, not inside the classes
 # -----------------------------------------------------------------------
-WATCHLIST        = ['BEL.NS', 'ADANIPOWER.NS', 'SOLARINDS.NS', 'SUNPHARMA.NS','RELIANCE.NS','STLTECH.NS']
+WATCHLIST        = ['ELECTCAST.NS', 'GMDCLTD.NS', 'BAJAJHIND.NS', 'NMDC.NS','RELIANCE.NS','STLTECH.NS']
 INITIAL_CAPITAL  = 100_000          # ₹1,00,000
 
-START            = "2019-01-01"
+START            = "2022-01-01"
 END              = "2026-05-10"
 
 # Strategy parameters
